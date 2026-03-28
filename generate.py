@@ -35,12 +35,26 @@ POLL_MAX_RETRY   = 40   # maks coba (40 x 15s = 10 menit)
 GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
-# SUNO_TOKENS: JSON array string → ["token1","token2",...]
-raw_tokens  = os.environ.get("SUNO_TOKENS", "[]")
-try:
-    SUNO_TOKENS = json.loads(raw_tokens)
-except Exception:
-    SUNO_TOKENS = [t.strip() for t in raw_tokens.split(",") if t.strip()]
+# SUNO_TOKENS: bisa plain token, JSON array, atau dipisah koma
+raw_tokens = os.environ.get("SUNO_TOKENS", "").strip()
+
+if not raw_tokens:
+    SUNO_TOKENS = []
+elif raw_tokens.startswith("["):
+    # Format JSON array: ["token1","token2"]
+    try:
+        SUNO_TOKENS = json.loads(raw_tokens)
+    except Exception:
+        SUNO_TOKENS = []
+else:
+    # Format plain: token langsung, atau dipisah koma/baris baru
+    SUNO_TOKENS = [
+        t.strip().strip("'\"")
+        for t in raw_tokens.replace("\n", ",").split(",")
+        if t.strip().strip("'\"")
+    ]
+
+print(f"  DEBUG: {len(SUNO_TOKENS)} token(s) loaded")
 
 # ══════════════════════════════════════════════════════
 #  UTILS FILE
