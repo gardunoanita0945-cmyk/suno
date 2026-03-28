@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════╗
-║         SUNO AUTO GENERATOR — Full Script v4         ║
-║  Auth   : JWT Token (window.Clerk.session.getToken)  ║
-║  Input  : titles.txt + config.json + accounts.json   ║
+║         SUNO AUTO GENERATOR — Full Script v5         ║
+║  Input  : titles.txt + config.json                   ║
 ║  Output : output_audio/ (MP3 + TXT lyrics)           ║
 ║  Track  : done.txt                                   ║
 ╚══════════════════════════════════════════════════════╝
@@ -18,16 +17,15 @@ from google import genai
 # ══════════════════════════════════════════════════════
 #  KONSTANTA
 # ══════════════════════════════════════════════════════
-MAX_PER_ACCOUNT  = 8
-OUTPUT_DIR       = "output_audio"
-TITLES_FILE      = "titles.txt"
-DONE_FILE        = "done.txt"
-CONFIG_FILE      = "config.json"
-ACCOUNTS_FILE    = "accounts.json"
-SUNO_GENERATE    = "https://studio-api.suno.ai/api/generate/v2/"
-SUNO_FEED        = "https://studio-api.suno.ai/api/feed/"
-POLL_INTERVAL    = 15   # detik antar poll
-POLL_MAX_RETRY   = 40   # maks coba (40 x 15s = 10 menit)
+MAX_PER_ACCOUNT = 8
+OUTPUT_DIR      = "output_audio"
+TITLES_FILE     = "titles.txt"
+DONE_FILE       = "done.txt"
+CONFIG_FILE     = "config.json"
+SUNO_GENERATE   = "https://studio-api.suno.ai/api/generate/v2/"
+SUNO_FEED       = "https://studio-api.suno.ai/api/feed/"
+POLL_INTERVAL   = 15
+POLL_MAX_RETRY  = 40
 
 # ══════════════════════════════════════════════════════
 #  AMBIL ENV / SECRETS
@@ -35,19 +33,15 @@ POLL_MAX_RETRY   = 40   # maks coba (40 x 15s = 10 menit)
 GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
-# SUNO_TOKENS: bisa plain token, JSON array, atau dipisah koma
 raw_tokens = os.environ.get("SUNO_TOKENS", "").strip()
-
 if not raw_tokens:
     SUNO_TOKENS = []
 elif raw_tokens.startswith("["):
-    # Format JSON array: ["token1","token2"]
     try:
         SUNO_TOKENS = json.loads(raw_tokens)
     except Exception:
         SUNO_TOKENS = []
 else:
-    # Format plain: token langsung, atau dipisah koma/baris baru
     SUNO_TOKENS = [
         t.strip().strip("'\"")
         for t in raw_tokens.replace("\n", ",").split(",")
@@ -83,12 +77,6 @@ def load_config() -> dict:
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def load_accounts() -> list:
-    if not os.path.exists(ACCOUNTS_FILE):
-        return [{"label": f"account_{i+1}"} for i in range(len(SUNO_TOKENS))]
-    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
 def safe_filename(title: str) -> str:
     for c in r'\/:*?"<>|':
         title = title.replace(c, "")
@@ -115,47 +103,96 @@ def _lyrics_prompt(title: str, music_prompt: str) -> str:
     )
 
 # ══════════════════════════════════════════════════════
-#  LYRIC GENERATOR — GEMINI
+#  LYRIC GENERATOR — GEMINI (retry + multi model)
 # ══════════════════════════════════════════════════════
 def generate_lyrics_gemini(title: str, music_prompt: str) -> str:
-    client   = genai.Client(api_key=GEMINI_KEY)
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=_lyrics_prompt(title, music_prompt)
-    )
-    lyrics = response.text.strip()
-    if not lyrics:
-        raise ValueError("Gemini returned empty response")
-    return lyrics
+    client  = genai.Client(api_key=GEMINI_KEY)
+    models  = [
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+    ]
+    last_error = None
+    for model_name in models:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=_lyrics_prompt(title, music_prompt)
+                )
+                lyrics = response.text.strip()
+                if lyrics:
+                    print(f"      ✅ Gemini OK ({model_name})")
+                    return lyrics
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait = 30 * (attempt + 1)
+                    print(f"      ⏳ Rate limit [{model_name}] tunggu {wait}s (attempt {attempt+1}/3)...")
+                    time.sleep(wait)
+                else:
+                    print(f"      ⚠️  [{model_name}] error: {e}")
+                    break
+    raise Exception(f"Semua Gemini model gagal: {last_error}")
 
 # ══════════════════════════════════════════════════════
-#  LYRIC GENERATOR — OPENROUTER (cadangan)
+#  LYRIC GENERATOR — OPENROUTER (multi model fallback)
 # ══════════════════════════════════════════════════════
 def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
+    free_models = [
+        "meta-llama/llama-3.2-3b-instruct:free",
+        "google/gemma-3-12b-it:free",
+        "mistralai/mistral-7b-instruct:free",
+        "microsoft/phi-3-mini-128k-instruct:free",
+        "deepseek/deepseek-r1-distill-llama-70b:free",
+    ]
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/suno-auto-generator",
         "X-Title": "Suno Auto Generator",
     }
-    payload = {
-        "model": "meta-llama/llama-3.1-8b-instruct:free",
-        "messages": [
-            {"role": "system", "content": "You are a professional song lyric writer. Write lyrics in English only. No explanation."},
-            {"role": "user",   "content": _lyrics_prompt(title, music_prompt)},
-        ],
-        "max_tokens": 800,
-        "temperature": 0.8,
-    }
-    resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers=headers, json=payload, timeout=60
-    )
-    resp.raise_for_status()
-    lyrics = resp.json()["choices"][0]["message"]["content"].strip()
-    if not lyrics:
-        raise ValueError("OpenRouter returned empty response")
-    return lyrics
+    last_error = None
+    for model in free_models:
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a professional song lyric writer. "
+                            "Write lyrics in English only. "
+                            "Do not add any explanation, only write the lyrics."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": _lyrics_prompt(title, music_prompt),
+                    },
+                ],
+                "max_tokens": 800,
+                "temperature": 0.8,
+            }
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data   = resp.json()
+            lyrics = data["choices"][0]["message"]["content"].strip()
+            if lyrics:
+                print(f"      ✅ OpenRouter OK ({model})")
+                return lyrics
+        except Exception as e:
+            last_error = e
+            print(f"      ⚠️  OpenRouter [{model}] gagal → {e}")
+            time.sleep(5)
+            continue
+    raise Exception(f"Semua OpenRouter model gagal: {last_error}")
 
 # ══════════════════════════════════════════════════════
 #  LYRIC GENERATOR — AUTO FALLBACK
@@ -164,33 +201,31 @@ def generate_lyrics(title: str, music_prompt: str) -> str:
     if GEMINI_KEY:
         try:
             print("      📝 Generating lyrics (Gemini)...")
-            lyrics = generate_lyrics_gemini(title, music_prompt)
-            print("      ✅ Gemini success")
-            return lyrics
+            return generate_lyrics_gemini(title, music_prompt)
         except Exception as e:
-            print(f"      ⚠️  Gemini failed → {e}")
+            print(f"      ⚠️  Gemini semua gagal → {e}")
+
     if OPENROUTER_KEY:
         try:
             print("      📝 Fallback to OpenRouter...")
-            lyrics = generate_lyrics_openrouter(title, music_prompt)
-            print("      ✅ OpenRouter success")
-            return lyrics
+            return generate_lyrics_openrouter(title, music_prompt)
         except Exception as e:
-            print(f"      ❌ OpenRouter failed → {e}")
-    raise RuntimeError("All LLM failed! Check API keys.")
+            print(f"      ❌ OpenRouter semua gagal → {e}")
+
+    raise RuntimeError("All LLM failed! Check GEMINI_API_KEY or OPENROUTER_API_KEY.")
 
 # ══════════════════════════════════════════════════════
-#  SUNO DIRECT API — GENERATE
+#  SUNO DIRECT API
 # ══════════════════════════════════════════════════════
 def suno_headers(token: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
     }
 
 def suno_generate(token: str, title: str, lyrics: str, style_tags: str) -> list:
-    """Submit ke Suno, return list clip_id."""
     payload = {
         "mv": "chirp-v3-5",
         "prompt": lyrics,
@@ -204,49 +239,53 @@ def suno_generate(token: str, title: str, lyrics: str, style_tags: str) -> list:
         SUNO_GENERATE,
         headers=suno_headers(token),
         json=payload,
-        timeout=60
+        timeout=60,
     )
     if resp.status_code != 200:
-        raise Exception(f"Suno generate failed: {resp.status_code} → {resp.text[:200]}")
-
-    data = resp.json()
+        raise Exception(f"Suno generate gagal: {resp.status_code} → {resp.text[:300]}")
+    data  = resp.json()
     clips = data.get("clips", [])
     if not clips:
-        raise Exception(f"Suno returned no clips: {data}")
+        raise Exception(f"Suno tidak return clip: {data}")
     ids = [c["id"] for c in clips]
     print(f"      🎬 Clip IDs: {ids}")
     return ids
 
 def suno_poll(token: str, clip_ids: list) -> list:
-    """Poll sampai semua clip selesai, return list dict clip."""
     ids_str = ",".join(clip_ids)
-    print(f"      ⏳ Polling audio status...")
+    print(f"      ⏳ Polling audio (max {POLL_MAX_RETRY * POLL_INTERVAL // 60} menit)...")
     for attempt in range(POLL_MAX_RETRY):
-        resp = requests.get(
-            f"{SUNO_FEED}?ids={ids_str}",
-            headers=suno_headers(token),
-            timeout=30
-        )
-        if resp.status_code != 200:
-            print(f"      ⚠️  Poll error {resp.status_code}, retry...")
-            time.sleep(POLL_INTERVAL)
-            continue
+        try:
+            resp = requests.get(
+                f"{SUNO_FEED}?ids={ids_str}",
+                headers=suno_headers(token),
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"      ⚠️  Poll error {resp.status_code}, retry...")
+                time.sleep(POLL_INTERVAL)
+                continue
 
-        clips = resp.json()
-        statuses = [c.get("status", "") for c in clips]
-        print(f"      📊 Status: {statuses} (attempt {attempt+1}/{POLL_MAX_RETRY})")
+            clips    = resp.json()
+            statuses = [c.get("status", "") for c in clips]
+            print(f"      📊 [{attempt+1}/{POLL_MAX_RETRY}] Status: {statuses}")
 
-        if all(s == "complete" for s in statuses):
-            return clips
-        if any(s == "error" for s in statuses):
-            raise Exception(f"Suno clip error: {clips}")
+            if all(s == "complete" for s in statuses):
+                print("      ✅ Audio selesai!")
+                return clips
+            if any(s == "error" for s in statuses):
+                raise Exception(f"Suno clip error: {clips}")
+
+        except Exception as e:
+            if "error" in str(e).lower() and "clip" in str(e).lower():
+                raise
+            print(f"      ⚠️  Poll exception: {e}")
 
         time.sleep(POLL_INTERVAL)
 
-    raise Exception("Polling timeout — audio tidak selesai dalam 10 menit")
+    raise Exception(f"Polling timeout setelah {POLL_MAX_RETRY * POLL_INTERVAL // 60} menit")
 
 def suno_download(clips: list, title: str) -> list:
-    """Download semua clip ke output_audio/."""
     saved = []
     for i, clip in enumerate(clips):
         audio_url = clip.get("audio_url", "")
@@ -263,7 +302,7 @@ def suno_download(clips: list, title: str) -> list:
     return saved
 
 def generate_audio(token: str, title: str, lyrics: str, style_tags: str) -> list:
-    print(f"      🎼 Submitting to Suno: '{title}'")
+    print(f"      🎼 Submit ke Suno: '{title}'")
     clip_ids = suno_generate(token, title, lyrics, style_tags)
     clips    = suno_poll(token, clip_ids)
     saved    = suno_download(clips, title)
@@ -272,17 +311,19 @@ def generate_audio(token: str, title: str, lyrics: str, style_tags: str) -> list
 # ══════════════════════════════════════════════════════
 #  PROSES 1 BATCH (1 AKUN, MAKS 8 LAGU)
 # ══════════════════════════════════════════════════════
-def process_batch(batch, music_prompt, style_tags, token, account_label, account_idx) -> list:
+def process_batch(batch, music_prompt, style_tags, token, account_idx) -> list:
     print(f"\n  {'─'*52}")
-    print(f"  🔑 Account #{account_idx+1}: {account_label} | {len(batch)} songs")
+    print(f"  🔑 Account #{account_idx+1} | {len(batch)} songs")
     print(f"  {'─'*52}")
 
     success = []
     for song_idx, title in enumerate(batch, 1):
         print(f"\n    [{song_idx}/{len(batch)}] 🎵 {title}")
         try:
-            # Step 1 — Lirik
+            # Step 1 — Generate lirik
             lyrics = generate_lyrics(title, music_prompt)
+
+            # Simpan lirik TXT
             lyric_path = os.path.join(OUTPUT_DIR, f"{safe_filename(title)}_lyrics.txt")
             with open(lyric_path, "w", encoding="utf-8") as lf:
                 lf.write(f"Title  : {title}\n")
@@ -290,9 +331,9 @@ def process_batch(batch, music_prompt, style_tags, token, account_label, account
                 lf.write(f"Style  : {style_tags}\n")
                 lf.write("─" * 40 + "\n\n")
                 lf.write(lyrics)
-            print(f"      📄 Lyrics saved: {lyric_path}")
+            print(f"      📄 Lyrics: {lyric_path}")
 
-            # Step 2 — Audio
+            # Step 2 — Generate & download audio
             generate_audio(token, title, lyrics, style_tags)
 
             # Step 3 — Tandai done
@@ -314,7 +355,7 @@ def process_batch(batch, music_prompt, style_tags, token, account_label, account
 # ══════════════════════════════════════════════════════
 def main():
     print("\n" + "═" * 55)
-    print("  🎵  SUNO AUTO GENERATOR v4")
+    print("  🎵  SUNO AUTO GENERATOR v5")
     print("═" * 55)
 
     if not SUNO_TOKENS:
@@ -325,7 +366,6 @@ def main():
     config       = load_config()
     music_prompt = config["music_prompt"]
     style_tags   = config["style_tags"]
-    accounts     = load_accounts()
 
     all_titles     = load_titles()
     done_set       = load_done()
@@ -333,13 +373,11 @@ def main():
     total_capacity = len(SUNO_TOKENS) * MAX_PER_ACCOUNT
     to_process     = pending[:total_capacity]
 
-    print(f"\n  Accounts loaded : {len(SUNO_TOKENS)}")
-    for i, acc in enumerate(accounts[:len(SUNO_TOKENS)]):
-        print(f"    #{i+1} → {acc.get('label','?')}")
-    print(f"\n  Capacity/day    : {total_capacity} songs")
-    print(f"  Total titles    : {len(all_titles)}")
-    print(f"  Already done    : {len(done_set)}")
-    print(f"  Will process    : {len(to_process)}")
+    print(f"\n  Suno accounts  : {len(SUNO_TOKENS)}")
+    print(f"  Capacity/day   : {total_capacity} songs")
+    print(f"  Total titles   : {len(all_titles)}")
+    print(f"  Already done   : {len(done_set)}")
+    print(f"  Will process   : {len(to_process)}")
 
     if not to_process:
         print("\n  ✅ All titles already processed!")
@@ -352,8 +390,7 @@ def main():
     all_success = []
 
     for idx, (batch, token) in enumerate(zip(batches, SUNO_TOKENS)):
-        label   = accounts[idx].get("label", f"account_{idx+1}") if idx < len(accounts) else f"account_{idx+1}"
-        success = process_batch(batch, music_prompt, style_tags, token, label, idx)
+        success = process_batch(batch, music_prompt, style_tags, token, idx)
         all_success.extend(success)
         if idx < len(batches) - 1:
             print(f"\n  ⏳ Waiting 30 seconds before next account...")
