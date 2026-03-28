@@ -217,22 +217,53 @@ def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
 # ══════════════════════════════════════════════════════
 def generate_lyrics(title: str, music_prompt: str):
     """Return (lyrics, use_custom). lyrics=None → Suno auto."""
+    raw = None
+
     if GEMINI_KEY:
         try:
             print("      📝 Generating lyrics (Gemini)...")
-            return generate_lyrics_gemini(title, music_prompt), True
+            raw = generate_lyrics_gemini(title, music_prompt)
         except Exception as e:
             print(f"      ⚠️  Gemini gagal → {e}")
 
-    if OPENROUTER_KEY:
+    if raw is None and OPENROUTER_KEY:
         try:
             print("      📝 Fallback to OpenRouter...")
-            return generate_lyrics_openrouter(title, music_prompt), True
+            raw = generate_lyrics_openrouter(title, music_prompt)
         except Exception as e:
             print(f"      ⚠️  OpenRouter gagal → {e}")
 
-    print("      🎵 Fallback: Suno auto-generate lirik")
-    return None, False
+    if raw is None:
+        print("      🎵 Fallback: Suno auto-generate lirik")
+        return None, False
+
+    # ══ BERSIHKAN DI SINI sebelum dikembalikan ══
+    cleaned = (
+        raw
+        .replace("\u2190", "<-")
+        .replace("\u2192", "->")
+        .replace("\u2194", "<->")
+        .replace("\u2191", "^")
+        .replace("\u2193", "v")
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2026", "...")
+        .replace("\u2014", "--")
+        .replace("\u2013", "-")
+        .replace("\u2022", "-")
+        .replace("\u00e9", "e")
+        .replace("\u00e0", "a")
+        .replace("\u00e8", "e")
+        .replace("\u00f1", "n")
+        .replace("\u00fc", "u")
+        .replace("\u00f6", "o")
+        .replace("\u00e4", "a")
+    )
+    # Buang semua sisa non-ASCII yang mungkin masih ada
+    cleaned = cleaned.encode("ascii", errors="ignore").decode("ascii").strip()
+    return cleaned, True
 
 # ══════════════════════════════════════════════════════
 #  SUNO DIRECT API
