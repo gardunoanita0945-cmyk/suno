@@ -31,7 +31,7 @@ jobs:
         env:
           GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY:   ${{ secrets.OPENROUTER_API_KEY }}
-          SUNO_COOKIES:         ${{ secrets.SUNO_COOKIES }}
+          SUNO_TOKENS:          ${{ secrets.SUNO_TOKENS }}      ← nama baru
         run: python generate.py
 
       - name: 💾 Commit done.txt
