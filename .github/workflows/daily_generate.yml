@@ -24,14 +24,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 📦 Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: 🎼 Run Generator
+      - name: Install dependencies
+        run: |
+          pip install requests google-genai playwright
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: Run generator
         env:
-          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
-          OPENROUTER_API_KEY:   ${{ secrets.OPENROUTER_API_KEY }}
-          SUNO_TOKENS:          ${{ secrets.SUNO_TOKENS }}      ← nama baru
+          SUNO_COOKIE:    ${{ secrets.SUNO_COOKIE }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: python generate.py
 
       - name: 💾 Commit done.txt
