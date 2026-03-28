@@ -1,39 +1,52 @@
 #!/usr/bin/env python3
 """
-SUNO AUTO GENERATOR v13
-Fix: token sanitize, http.client manual headers, config simple
+SUNO AUTO GENERATOR v14 — Playwright Browser Automation
+Bypass studio-api.suno.ai (suspended) dengan control browser langsung
+Setup:
+  pip install playwright requests google-genai
+  playwright install chromium
+Secrets:
+  SUNO_COOKIE     = cookie string dari browser (F12 → Network → copy cookie header)
+  GEMINI_API_KEY  = optional
+  OPENROUTER_KEY  = optional
 """
 
-import http.client
 import json
 import os
+import re
 import sys
 import time
 import traceback
-import urllib.parse
 
 import requests
-from google import genai
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+try:
+    from google import genai
+    GENAI_OK = True
+except ImportError:
+    GENAI_OK = False
 
 # ══════════════════════════════════════════════════════
 #  KONSTANTA
 # ══════════════════════════════════════════════════════
-MAX_PER_ACCOUNT = 8
-OUTPUT_DIR      = "output_audio"
-TITLES_FILE     = "titles.txt"
-DONE_FILE       = "done.txt"
-CONFIG_FILE     = "config.json"
-SUNO_HOST       = "studio-api.suno.ai"
-SUNO_PATH       = "/api/generate/v2/"
-SUNO_FEED_URL   = "https://studio-api.suno.ai/api/feed/"
-POLL_INTERVAL   = 15
-POLL_MAX_RETRY  = 40
+MAX_PER_ACCOUNT  = 8
+OUTPUT_DIR       = "output_audio"
+TITLES_FILE      = "titles.txt"
+DONE_FILE        = "done.txt"
+CONFIG_FILE      = "config.json"
+SUNO_CREATE_URL  = "https://suno.com/create"
+SUNO_DOMAIN      = "suno.com"
+POLL_INTERVAL    = 8    # detik antar cek status di halaman
+POLL_MAX         = 90   # max iterasi poll (~12 menit)
+BETWEEN_SONGS    = 20   # detik jeda antar lagu
 
 # ══════════════════════════════════════════════════════
 #  ENV / SECRETS
 # ══════════════════════════════════════════════════════
 GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+SUNO_COOKIE    = os.environ.get("SUNO_COOKIE", "").strip()
 
 def _parse_tokens(raw: str) -> list:
     raw = raw.strip()
@@ -44,42 +57,21 @@ def _parse_tokens(raw: str) -> list:
             return json.loads(raw)
         except Exception:
             pass
-    tokens = []
-    for t in raw.replace("\n", ",").split(","):
-        t = t.strip().strip("'\"")
-        if t:
-            tokens.append(t)
-    return tokens
+    return [t.strip().strip("'\"") for t in raw.replace("\n", ",").split(",") if t.strip()]
 
 SUNO_TOKENS = _parse_tokens(os.environ.get("SUNO_TOKENS", ""))
 
-print(f"  DEBUG: {len(SUNO_TOKENS)} token(s) loaded")
 print(f"  DEBUG: Python {sys.version.split()[0]} | requests {requests.__version__}")
+print(f"  DEBUG: SUNO_COOKIE={'set' if SUNO_COOKIE else 'MISSING'}")
+print(f"  DEBUG: SUNO_TOKENS={len(SUNO_TOKENS)} token(s)")
 
 # ══════════════════════════════════════════════════════
 #  ASCII UTILS
 # ══════════════════════════════════════════════════════
 def force_ascii(text) -> str:
-    """Paksa string jadi pure printable ASCII, tidak ada pengecualian."""
     if text is None:
         return ""
     return str(text).encode("ascii", errors="ignore").decode("ascii").strip()
-
-def check_ascii(label: str, text: str):
-    """Print karakter non-ASCII yang masih ada (untuk debug)."""
-    bad = [(i, c, hex(ord(c))) for i, c in enumerate(text) if ord(c) > 127]
-    if bad:
-        print(f"      ⚠️  NON-ASCII in [{label}]: {bad[:5]}")
-        return False
-    return True
-
-def sanitize_token(token: str) -> str:
-    """Bersihkan token JWT — hanya A-Z a-z 0-9 . - _ ="""
-    import re
-    cleaned = re.sub(r"[^A-Za-z0-9.\-_=]", "", token)
-    if len(cleaned) != len(token):
-        print(f"      ⚠️  Token sanitized: {len(token)} → {len(cleaned)} chars")
-    return cleaned
 
 # ══════════════════════════════════════════════════════
 #  FILE UTILS
@@ -112,101 +104,35 @@ def safe_filename(title: str) -> str:
     return title.replace(" ", "_")[:80]
 
 # ══════════════════════════════════════════════════════
-#  SUNO POST — http.client FULL MANUAL (no requests)
-# ══════════════════════════════════════════════════════
-def suno_post(token: str, payload: dict, timeout: int = 60) -> dict:
-    """
-    POST ke Suno tanpa requests library sama sekali.
-    Semua header di-encode manual sebagai bytes ASCII.
-    """
-    # 1. Sanitize token
-    token_safe = sanitize_token(token)
-
-    # 2. Serialize payload → ASCII bytes
-    json_str = json.dumps(payload, ensure_ascii=True)
-    body     = json_str.encode("ascii")
-
-    # 3. Debug
-    check_ascii("JSON body", json_str)
-    check_ascii("token",     token_safe)
-    print(f"      🔍 Body: {len(body)} bytes | Token: ...{token_safe[-20:]}")
-
-    # 4. Build headers sebagai dict of bytes
-    auth_line  = f"Bearer {token_safe}"
-    hdrs = {
-        b"Authorization":  auth_line.encode("ascii"),
-        b"Content-Type":   b"application/json",
-        b"Content-Length": str(len(body)).encode("ascii"),
-        b"User-Agent":     b"Mozilla/5.0",
-        b"Accept":         b"application/json",
-    }
-
-    # 5. Kirim via http.client
-    conn = http.client.HTTPSConnection(SUNO_HOST, timeout=timeout)
-    conn.connect()
-    # Kirim request line
-    conn.putrequest("POST", SUNO_PATH)
-    # Kirim setiap header sebagai bytes
-    for k, v in hdrs.items():
-        conn._send_output(None)  # flush buffer aman
-        conn.putheader(k.decode(), v.decode("ascii"))
-    conn.endheaders(body)
-
-    resp      = conn.getresponse()
-    status    = resp.status
-    resp_body = resp.read()
-    conn.close()
-
-    print(f"      📡 Suno response: {status}")
-
-    if status == 401:
-        raise Exception("Token expired/invalid. Buat token baru di suno.com.")
-    if status == 403:
-        raise Exception("Akses ditolak. Cek subscription Suno.")
-    if status == 429:
-        raise Exception("Suno rate limit. Coba lagi nanti.")
-    if status != 200:
-        raise Exception(
-            f"Suno HTTP {status} → "
-            + resp_body[:400].decode("utf-8", errors="replace")
-        )
-
-    return json.loads(resp_body.decode("utf-8"))
-
-# ══════════════════════════════════════════════════════
-#  LYRIC SYSTEM PROMPT
+#  LYRIC PROMPT
 # ══════════════════════════════════════════════════════
 LYRIC_SYSTEM = (
-    "You are a song lyric writer. "
-    "Write lyrics in English only. "
-    "Use ONLY standard ASCII: a-z A-Z 0-9 spaces and basic punctuation . , ! ? ' - ( ) "
-    "NO arrows, emoji, accented letters, special symbols, or unicode. "
-    "Output lyrics only, no title, no explanation."
+    "You are a song lyric writer. Write lyrics in English only. "
+    "Use ONLY standard ASCII characters. NO arrows, emoji, or unicode. "
+    "Output lyrics only, no explanation."
 )
 
 def _lyrics_prompt(title: str, mood: str) -> str:
     return (
-        f'Write song lyrics for a song titled "{title}".\n'
+        f'Write song lyrics titled "{title}".\n'
         f"Mood/Genre: {mood}\n\n"
-        f"[Verse 1]\n(4 lines)\n\n"
-        f"[Chorus]\n(4 lines)\n\n"
-        f"[Verse 2]\n(4 lines)\n\n"
-        f"[Chorus]\n(4 lines)\n\n"
-        f"[Outro]\n(2 lines)\n\n"
-        f"Max 250 words. ASCII only. Lyrics only."
+        f"[Verse 1]\n(4 lines)\n\n[Chorus]\n(4 lines)\n\n"
+        f"[Verse 2]\n(4 lines)\n\n[Chorus]\n(4 lines)\n\n"
+        f"[Outro]\n(2 lines)\n\nMax 250 words. ASCII only."
     )
 
 # ══════════════════════════════════════════════════════
 #  LYRIC GENERATOR — GEMINI
 # ══════════════════════════════════════════════════════
 def _gemini_lyrics(title: str, mood: str):
+    if not GENAI_OK or not GEMINI_KEY:
+        return None
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         for model in ["gemini-2.0-flash-lite", "gemini-2.0-flash"]:
             try:
                 r = client.models.generate_content(
-                    model=model,
-                    contents=_lyrics_prompt(title, mood),
+                    model=model, contents=_lyrics_prompt(title, mood)
                 )
                 text = r.text.strip()
                 if text:
@@ -219,13 +145,15 @@ def _gemini_lyrics(title: str, mood: str):
                     return None
                 print(f"      ⚠️  Gemini [{model}]: {e}")
     except Exception as e:
-        print(f"      ⚠️  Gemini init: {e}")
+        print(f"      ⚠️  Gemini: {e}")
     return None
 
 # ══════════════════════════════════════════════════════
 #  LYRIC GENERATOR — OPENROUTER
 # ══════════════════════════════════════════════════════
 def _openrouter_lyrics(title: str, mood: str):
+    if not OPENROUTER_KEY:
+        return None
     models = [
         "meta-llama/llama-3.3-70b-instruct:free",
         "mistralai/mistral-small-3.1-24b-instruct:free",
@@ -235,9 +163,9 @@ def _openrouter_lyrics(title: str, mood: str):
     ]
     hdrs = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://github.com/suno-auto",
-        "X-Title":       "Suno Auto Generator",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/suno-auto",
+        "X-Title": "Suno Auto Generator",
     }
     for model in models:
         try:
@@ -245,7 +173,7 @@ def _openrouter_lyrics(title: str, mood: str):
                 "model": model,
                 "messages": [
                     {"role": "system", "content": LYRIC_SYSTEM},
-                    {"role": "user",   "content": _lyrics_prompt(title, mood)},
+                    {"role": "user", "content": _lyrics_prompt(title, mood)},
                 ],
                 "max_tokens": 700,
                 "temperature": 0.8,
@@ -264,7 +192,6 @@ def _openrouter_lyrics(title: str, mood: str):
             resp.raise_for_status()
             data = resp.json()
             if not data.get("choices"):
-                print(f"      ⚠️  [{model}] no choices")
                 continue
             text = data["choices"][0]["message"]["content"].strip()
             if text:
@@ -279,120 +206,215 @@ def _openrouter_lyrics(title: str, mood: str):
 #  LYRIC FALLBACK CHAIN
 # ══════════════════════════════════════════════════════
 def generate_lyrics(title: str, mood: str):
-    """Return (lyrics_ascii | None, use_custom: bool)"""
     raw = None
-
     if GEMINI_KEY:
         print("      📝 Generating lyrics (Gemini)...")
         raw = _gemini_lyrics(title, mood)
-
     if raw is None and OPENROUTER_KEY:
         print("      📝 Fallback → OpenRouter...")
         raw = _openrouter_lyrics(title, mood)
-
     if raw is None:
         print("      🎵 Semua LLM gagal → Suno auto-lyrics")
         return None, False
-
     clean = force_ascii(raw)
-    check_ascii("lyrics", clean)
     print(f"      📝 Lyrics ready: {len(clean)} chars")
     return clean, True
 
 # ══════════════════════════════════════════════════════
-#  SUNO GENERATE
+#  COOKIE STRING → Playwright cookies list
 # ══════════════════════════════════════════════════════
-def suno_generate(token: str, title: str, lyrics, style_tags: str, use_custom: bool) -> list:
+def parse_cookie_string(cookie_str: str, domain: str = "suno.com") -> list:
+    """Convert 'key=val; key2=val2' → list of Playwright cookie dicts."""
+    cookies = []
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name  = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        cookies.append({
+            "name":   name,
+            "value":  value,
+            "domain": f".{domain}",
+            "path":   "/",
+        })
+    return cookies
+
+# ══════════════════════════════════════════════════════
+#  PLAYWRIGHT — CREATE 1 LAGU
+# ══════════════════════════════════════════════════════
+def pw_create_song(page, title: str, lyrics, style_tags: str, use_custom: bool) -> list:
+    """
+    Navigasi ke suno.com/create, isi form, klik Create,
+    tunggu audio selesai, return list audio_url.
+    """
+    captured_clips = []
+
+    # Intercept response dari endpoint generate/feed untuk ambil audio URL
+    def on_response(response):
+        url = response.url
+        if any(x in url for x in ["/api/generate", "/api/feed", "/api/clip"]):
+            try:
+                body = response.json()
+                # Generate response
+                if isinstance(body, dict) and "clips" in body:
+                    for clip in body["clips"]:
+                        cid = clip.get("id", "")
+                        if cid and cid not in [c.get("id") for c in captured_clips]:
+                            captured_clips.append(clip)
+                            print(f"      📡 Captured clip: {cid}")
+                # Feed response (array)
+                if isinstance(body, list):
+                    for clip in body:
+                        if isinstance(clip, dict):
+                            cid = clip.get("id", "")
+                            aud = clip.get("audio_url", "")
+                            if cid and aud:
+                                for c in captured_clips:
+                                    if c.get("id") == cid:
+                                        c["audio_url"]  = aud
+                                        c["status"]     = clip.get("status", "")
+            except Exception:
+                pass
+
+    page.on("response", on_response)
+
+    # Buka halaman create
+    print("      🌐 Navigasi ke suno.com/create ...")
+    page.goto(SUNO_CREATE_URL, wait_until="domcontentloaded", timeout=60_000)
+    page.wait_for_timeout(3000)
+
+    # Klik tab "Custom"
+    try:
+        custom_btn = page.locator("button:has-text('Custom'), [data-tab='custom'], label:has-text('Custom')")
+        custom_btn.first.click(timeout=10_000)
+        page.wait_for_timeout(1000)
+        print("      🎛️  Custom mode aktif")
+    except PWTimeout:
+        print("      ⚠️  Custom button tidak ditemukan, coba selector lain...")
+        # Fallback: cari semua button yang ada
+        btns = page.locator("button").all_text_contents()
+        print(f"      🔍 Buttons: {btns[:10]}")
+
     title_a = force_ascii(title)
     tags_a  = force_ascii(style_tags)
 
+    # Isi Style of Music
+    try:
+        style_input = page.locator(
+            "input[placeholder*='style' i], input[placeholder*='genre' i], "
+            "textarea[placeholder*='style' i], [aria-label*='style' i]"
+        ).first
+        style_input.click()
+        style_input.fill(tags_a)
+        page.wait_for_timeout(500)
+        print(f"      🎸 Style: {tags_a[:50]}")
+    except Exception as e:
+        print(f"      ⚠️  Style input: {e}")
+
+    # Isi Title
+    try:
+        title_input = page.locator(
+            "input[placeholder*='title' i], input[name='title'], "
+            "[aria-label*='title' i]"
+        ).first
+        title_input.click()
+        title_input.fill(title_a)
+        page.wait_for_timeout(500)
+        print(f"      🏷️  Title: {title_a}")
+    except Exception as e:
+        print(f"      ⚠️  Title input: {e}")
+
+    # Isi Lyrics (jika custom)
     if use_custom and lyrics:
-        lyrics_a = force_ascii(lyrics)
-        payload  = {
-            "mv":               "chirp-v3-5",
-            "prompt":           lyrics_a,
-            "tags":             tags_a,
-            "title":            title_a,
-            "make_instrumental": False,
-            "continue_clip_id": None,
-            "continue_at":      None,
-        }
-        print("      🎼 Mode: Custom lyrics")
-    else:
-        payload = {
-            "mv":               "chirp-v3-5",
-            "prompt":           f"{title_a}. {tags_a}",
-            "tags":             tags_a,
-            "title":            title_a,
-            "make_instrumental": False,
-            "continue_clip_id": None,
-            "continue_at":      None,
-        }
-        print("      🎼 Mode: Suno auto-lyrics")
-
-    data  = suno_post(token, payload)
-    clips = data.get("clips", [])
-    if not clips:
-        raise Exception(f"Suno tidak return clip: {data}")
-    ids = [c["id"] for c in clips]
-    print(f"      🎬 Clip IDs: {ids}")
-    return ids
-
-# ══════════════════════════════════════════════════════
-#  SUNO POLL
-# ══════════════════════════════════════════════════════
-def suno_poll(token: str, clip_ids: list) -> list:
-    ids_str = ",".join(clip_ids)
-    print(f"      ⏳ Polling (max {POLL_MAX_RETRY * POLL_INTERVAL // 60} menit)...")
-    for attempt in range(POLL_MAX_RETRY):
         try:
-            resp = requests.get(
-                f"{SUNO_FEED_URL}?ids={ids_str}",
-                headers={
-                    "Authorization": f"Bearer {sanitize_token(token)}",
-                    "Accept":        "application/json",
-                },
-                timeout=30,
-            )
-            if resp.status_code == 401:
-                raise Exception("Token expired saat polling.")
-            if resp.status_code != 200:
-                print(f"      ⚠️  Poll {resp.status_code}, retry...")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            data  = resp.json()
-            clips = data if isinstance(data, list) else data.get("clips", [])
-
-            statuses = [c.get("status", "") for c in clips if isinstance(c, dict)]
-            print(f"      📊 [{attempt+1}/{POLL_MAX_RETRY}] {statuses}")
-
-            if all(s == "complete" for s in statuses):
-                print("      ✅ Audio selesai!")
-                return clips
-            if any(s == "error" for s in statuses):
-                raise Exception(f"Suno clip error: {clips}")
-
+            lyric_input = page.locator(
+                "textarea[placeholder*='lyric' i], textarea[placeholder*='Enter your own' i], "
+                "textarea[placeholder*='lyrics' i], [aria-label*='lyric' i]"
+            ).first
+            lyric_input.click()
+            lyric_input.fill(force_ascii(lyrics))
+            page.wait_for_timeout(500)
+            print(f"      📜 Lyrics diisi ({len(lyrics)} chars)")
         except Exception as e:
-            if any(x in str(e) for x in ["clip error", "Token expired"]):
-                raise
-            print(f"      ⚠️  Poll exception: {e}")
+            print(f"      ⚠️  Lyrics input: {e}")
+            use_custom = False
 
-        time.sleep(POLL_INTERVAL)
+    # Klik Create
+    try:
+        create_btn = page.locator(
+            "button:has-text('Create'), button[type='submit']:has-text('Create'), "
+            "button:has-text('Generate')"
+        ).first
+        create_btn.click(timeout=10_000)
+        print("      🎬 Klik Create!")
+        page.wait_for_timeout(3000)
+    except Exception as e:
+        print(f"      ⚠️  Create button: {e}")
+        raise Exception(f"Gagal klik Create: {e}")
 
-    raise Exception(f"Polling timeout {POLL_MAX_RETRY * POLL_INTERVAL // 60} menit")
+    # Poll sampai audio_url tersedia
+    print(f"      ⏳ Menunggu audio (max {POLL_MAX * POLL_INTERVAL // 60} menit)...")
+    completed = []
+
+    for attempt in range(POLL_MAX):
+        page.wait_for_timeout(POLL_INTERVAL * 1000)
+
+        # Cek captured_clips dari network intercept
+        done = [c for c in captured_clips if c.get("audio_url") and c.get("status") == "complete"]
+        if done:
+            print(f"      ✅ Audio ready via intercept! ({len(done)} clips)")
+            completed = done
+            break
+
+        # Fallback: cari audio element di DOM
+        try:
+            audio_els = page.locator("audio[src]").all()
+            for el in audio_els:
+                src = el.get_attribute("src") or ""
+                if src.startswith("http") and src not in [c.get("audio_url") for c in completed]:
+                    completed.append({"audio_url": src, "id": f"dom_{len(completed)}"})
+            if completed:
+                print(f"      ✅ Audio ready via DOM! ({len(completed)} clips)")
+                break
+        except Exception:
+            pass
+
+        # Progress log
+        statuses = [c.get("status", "?") for c in captured_clips]
+        print(f"      📊 [{attempt+1}/{POLL_MAX}] clips={len(captured_clips)} statuses={statuses}")
+
+        # Cek error di halaman
+        try:
+            err_el = page.locator("[class*='error' i]:visible, [data-error]:visible").first
+            err_txt = err_el.inner_text(timeout=1000)
+            if err_txt:
+                raise Exception(f"Suno error di halaman: {err_txt}")
+        except PWTimeout:
+            pass
+
+    page.remove_listener("response", on_response)
+
+    if not completed:
+        # Screenshot untuk debug
+        ss_path = os.path.join(OUTPUT_DIR, f"{safe_filename(title)}_debug.png")
+        page.screenshot(path=ss_path)
+        print(f"      📸 Screenshot: {ss_path}")
+        raise Exception("Timeout: audio tidak muncul setelah polling")
+
+    return completed
 
 # ══════════════════════════════════════════════════════
-#  SUNO DOWNLOAD
+#  DOWNLOAD AUDIO
 # ══════════════════════════════════════════════════════
-def suno_download(clips: list, title: str) -> list:
+def download_clips(clips: list, title: str) -> list:
     saved = []
     for i, clip in enumerate(clips):
-        if not isinstance(clip, dict):
-            continue
         url = clip.get("audio_url", "")
         if not url:
-            print(f"      ⚠️  Clip {i+1}: no audio_url")
             continue
         fname = os.path.join(OUTPUT_DIR, f"{safe_filename(title)}_{i+1}.mp3")
         try:
@@ -406,46 +428,106 @@ def suno_download(clips: list, title: str) -> list:
             print(f"      ⚠️  Download gagal clip {i+1}: {e}")
     return saved
 
-def generate_audio(token, title, lyrics, style_tags, use_custom):
-    ids   = suno_generate(token, title, lyrics, style_tags, use_custom)
-    clips = suno_poll(token, ids)
-    return suno_download(clips, title)
-
 # ══════════════════════════════════════════════════════
-#  PROSES 1 BATCH
+#  PROSES BATCH — 1 BROWSER SESSION
 # ══════════════════════════════════════════════════════
-def process_batch(batch, mood, style_tags, token, idx) -> list:
+def process_batch(batch, mood, style_tags, cookie_str, account_idx) -> list:
     print(f"\n  {'─'*52}")
-    print(f"  🔑 Account #{idx+1} | {len(batch)} songs")
+    print(f"  🔑 Account #{account_idx+1} | {len(batch)} songs | Playwright")
     print(f"  {'─'*52}")
 
     success = []
-    for i, title in enumerate(batch, 1):
-        print(f"\n    [{i}/{len(batch)}] 🎵 {title}")
-        try:
-            lyrics, use_custom = generate_lyrics(title, mood)
 
-            if lyrics:
-                path = os.path.join(OUTPUT_DIR, f"{safe_filename(title)}_lyrics.txt")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(f"Title : {title}\nStyle : {style_tags}\n")
-                    f.write("-" * 40 + "\n\n" + lyrics)
-                print(f"      📄 Lyrics: {path}")
-            else:
-                print("      📄 Suno akan auto-generate lirik")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
 
-            generate_audio(token, title, lyrics, style_tags, use_custom)
-            mark_done(title)
-            success.append(title)
-            print(f"      ✅ Done: {title}")
+        # Inject cookies
+        if cookie_str:
+            cookies = parse_cookie_string(cookie_str, SUNO_DOMAIN)
+            context.add_cookies(cookies)
+            print(f"      🍪 {len(cookies)} cookies injected")
+        else:
+            print("      ⚠️  SUNO_COOKIE kosong! Set di GitHub Secrets.")
 
-        except Exception as e:
-            print(f"      ❌ FAILED [{title}]: {e}")
-            traceback.print_exc()   # ← full stack trace untuk debug
+        page = context.new_page()
 
-        if i < len(batch):
-            print("      ⏳ Waiting 15s...")
-            time.sleep(15)
+        # Buka halaman awal untuk verifikasi login
+        print("      🔐 Cek login status...")
+        page.goto("https://suno.com", wait_until="domcontentloaded", timeout=30_000)
+        page.wait_for_timeout(3000)
+
+        # Cek apakah sudah login
+        page_content = page.content()
+        if "Log in" in page_content and "Log out" not in page_content:
+            print("      ⚠️  Mungkin belum login. Lanjut mencoba...")
+        else:
+            print("      ✅ Login OK")
+
+        # Screenshot home untuk debug
+        ss = os.path.join(OUTPUT_DIR, f"account{account_idx+1}_home.png")
+        page.screenshot(path=ss)
+        print(f"      📸 Home screenshot: {ss}")
+
+        for i, title in enumerate(batch, 1):
+            print(f"\n    [{i}/{len(batch)}] 🎵 {title}")
+            try:
+                # Generate lirik
+                lyrics, use_custom = generate_lyrics(title, mood)
+
+                # Simpan lirik
+                if lyrics:
+                    lpath = os.path.join(OUTPUT_DIR, f"{safe_filename(title)}_lyrics.txt")
+                    with open(lpath, "w", encoding="utf-8") as f:
+                        f.write(f"Title : {title}\nStyle : {style_tags}\n")
+                        f.write("-" * 40 + "\n\n" + lyrics)
+                    print(f"      📄 Lyrics: {lpath}")
+
+                # Buat lagu via Playwright
+                clips = pw_create_song(page, title, lyrics, style_tags, use_custom)
+
+                # Download audio
+                saved = download_clips(clips, title)
+
+                if saved:
+                    mark_done(title)
+                    success.append(title)
+                    print(f"      ✅ Done: {title} ({len(saved)} files)")
+                else:
+                    print(f"      ⚠️  Clip ada tapi download gagal")
+
+            except Exception as e:
+                print(f"      ❌ FAILED [{title}]: {e}")
+                traceback.print_exc()
+                # Screenshot untuk debug
+                try:
+                    ss = os.path.join(OUTPUT_DIR, f"{safe_filename(title)}_error.png")
+                    page.screenshot(path=ss)
+                    print(f"      📸 Error screenshot: {ss}")
+                except Exception:
+                    pass
+
+            if i < len(batch):
+                print(f"      ⏳ Waiting {BETWEEN_SONGS}s...")
+                time.sleep(BETWEEN_SONGS)
+
+        context.close()
+        browser.close()
 
     return success
 
@@ -454,38 +536,36 @@ def process_batch(batch, mood, style_tags, token, idx) -> list:
 # ══════════════════════════════════════════════════════
 def main():
     print("\n" + "═"*55)
-    print("  🎵  SUNO AUTO GENERATOR v13")
+    print("  🎵  SUNO AUTO GENERATOR v14 (Playwright)")
     print("═"*55)
 
-    if not SUNO_TOKENS:
-        raise RuntimeError("❌ SUNO_TOKENS kosong! Tambahkan ke GitHub Secrets.")
+    # Validasi
+    if not SUNO_COOKIE and not SUNO_TOKENS:
+        raise RuntimeError(
+            "❌ Set SUNO_COOKIE di GitHub Secrets!\n"
+            "   Cara: F12 → Network → request ke suno.com → copy header 'Cookie'"
+        )
 
     cfg        = load_config()
     mood       = force_ascii(cfg.get("music_prompt", ""))
-    style_tags = force_ascii(cfg.get("style_tags",   ""))
-
-    # Debug cek token karakter
-    for ti, tok in enumerate(SUNO_TOKENS):
-        tok_s = sanitize_token(tok)
-        print(f"  DEBUG: token[{ti}] len={len(tok)} → sanitized={len(tok_s)} chars")
-        check_ascii(f"token[{ti}]", tok)
+    style_tags = force_ascii(cfg.get("style_tags", ""))
 
     all_titles     = load_titles()
     done_set       = load_done()
     pending        = [t for t in all_titles if t not in done_set]
-    total_capacity = len(SUNO_TOKENS) * MAX_PER_ACCOUNT
+    total_capacity = MAX_PER_ACCOUNT  # 1 akun = 1 cookie
     to_process     = pending[:total_capacity]
 
-    print(f"\n  Suno accounts  : {len(SUNO_TOKENS)}")
+    print(f"\n  Suno accounts  : 1 (browser automation)")
     print(f"  Capacity/day   : {total_capacity} songs")
     print(f"  Total titles   : {len(all_titles)}")
     print(f"  Already done   : {len(done_set)}")
     print(f"  Will process   : {len(to_process)}")
-    print(f"  mood           : {mood[:60]}...")
-    print(f"  style_tags     : {style_tags[:60]}...")
+    print(f"  mood           : {mood[:60]}")
+    print(f"  style_tags     : {style_tags[:60]}")
     print(f"\n  LLM Gemini     : {'✅ ready' if GEMINI_KEY else '⚠️  skip'}")
     print(f"  LLM OpenRouter : {'✅ ready' if OPENROUTER_KEY else '⚠️  skip'}")
-    print(f"  Lyric fallback : ✅ Suno auto-generate")
+    print(f"  Mode           : 🎭 Playwright browser")
 
     if not to_process:
         print("\n  ✅ Semua title sudah diproses!")
@@ -493,25 +573,20 @@ def main():
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    batches     = [to_process[i:i+MAX_PER_ACCOUNT] for i in range(0, len(to_process), MAX_PER_ACCOUNT)]
-    all_success = []
+    # Gunakan SUNO_COOKIE (prioritas) atau SUNO_TOKENS[0] sebagai cookie fallback
+    cookie_str = SUNO_COOKIE or (SUNO_TOKENS[0] if SUNO_TOKENS else "")
 
-    for idx, (batch, token) in enumerate(zip(batches, SUNO_TOKENS)):
-        result = process_batch(batch, mood, style_tags, token, idx)
-        all_success.extend(result)
-        if idx < len(batches) - 1:
-            print("\n  ⏳ Waiting 30s before next account...")
-            time.sleep(30)
+    success = process_batch(to_process, mood, style_tags, cookie_str, 0)
 
-    remaining = len(pending) - len(all_success)
+    remaining = len(pending) - len(success)
     print("\n" + "═"*55)
-    print(f"  ✅ Success   : {len(all_success)} songs")
-    print(f"  ❌ Failed    : {len(to_process) - len(all_success)} songs")
+    print(f"  ✅ Success   : {len(success)} songs")
+    print(f"  ❌ Failed    : {len(to_process) - len(success)} songs")
     print(f"  📋 Remaining : {remaining} titles")
     print(f"  📁 Output    : ./{OUTPUT_DIR}/")
     print("═"*55 + "\n")
 
-    if len(all_success) == 0 and len(to_process) > 0:
+    if len(success) == 0 and len(to_process) > 0:
         raise RuntimeError("No songs generated!")
 
 if __name__ == "__main__":
