@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════╗
@@ -13,7 +12,7 @@ import os
 import json
 import time
 import requests
-import google.generativeai as genai
+from google import genai
 from suno import Suno, ModelVersions
 
 # ══════════════════════════════════════════════════════
@@ -89,13 +88,15 @@ def _lyrics_prompt(title: str, music_prompt: str) -> str:
     )
 
 # ══════════════════════════════════════════════════════
-#  LYRIC GENERATOR — GEMINI (utama)
+#  LYRIC GENERATOR — GEMINI (utama, SDK baru)
 # ══════════════════════════════════════════════════════
 def generate_lyrics_gemini(title: str, music_prompt: str) -> str:
-    genai.configure(api_key=GEMINI_KEY)
-    model    = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(_lyrics_prompt(title, music_prompt))
-    lyrics   = response.text.strip()
+    client   = genai.Client(api_key=GEMINI_KEY)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=_lyrics_prompt(title, music_prompt)
+    )
+    lyrics = response.text.strip()
     if not lyrics:
         raise ValueError("Gemini returned empty response")
     return lyrics
