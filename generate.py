@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════╗
-║         SUNO AUTO GENERATOR — Full Script v10        ║
-║  Fix   : encoding hard-fix, simple fallback          ║
+║         SUNO AUTO GENERATOR — Full Script v11        ║
+║  Fix   : manual JSON bytes, bypass requests json=    ║
 ║  Lyric : Gemini → OpenRouter → Suno Auto (fast)      ║
 ║  Input : titles.txt + config.json                    ║
 ║  Track : done.txt                                    ║
@@ -12,6 +12,7 @@
 import os
 import json
 import re
+import sys
 import time
 import requests
 from google import genai
@@ -51,6 +52,8 @@ else:
     ]
 
 print(f"  DEBUG: {len(SUNO_TOKENS)} token(s) loaded")
+print(f"  DEBUG: requests version = {requests.__version__}")
+print(f"  DEBUG: Python = {sys.version}")
 
 # ══════════════════════════════════════════════════════
 #  UTILS FILE
@@ -90,48 +93,40 @@ def safe_filename(title: str) -> str:
 
 
 # ══════════════════════════════════════════════════════
-#  TEXT SANITIZATION — NUCLEAR OPTION
+#  TEXT SANITIZATION
 # ══════════════════════════════════════════════════════
-
-# Regex: match SEMUA karakter yang BUKAN printable ASCII
-#   32 = spasi, 10 = newline, 13 = carriage return
 _NON_ASCII_RE = re.compile(r"[^\x20-\x7E\n\r\t]")
 
 
-def force_ascii(text: str) -> str:
-    """
-    Paksa teks jadi pure printable ASCII.
-    Tidak ada karakter non-ASCII yang bisa lolos.
-    """
+def force_ascii(text) -> str:
+    """Paksa teks jadi pure printable ASCII."""
+    if text is None:
+        return ""
+    text = str(text)
     if not text:
         return ""
-
-    # Langkah 1: encode → decode sebagai ASCII, buang yang bukan ASCII
+    # encode → decode ASCII, buang yang bukan ASCII
     text = text.encode("ascii", errors="ignore").decode("ascii")
-
-    # Langkah 2: Double-check — regex sweep untuk yang mungkin lolos
+    # regex sweep untuk yang mungkin lolos
     text = _NON_ASCII_RE.sub("", text)
-
-    # Langkah 3: Bersihkan whitespace berlebih per baris
+    # bersihkan whitespace berlebih
     lines = text.split("\n")
     lines = [" ".join(line.split()) for line in lines]
     text = "\n".join(lines)
-
-    # Langkah 4: Hapus baris kosong berturut-turut
-    cleaned_lines = []
+    # hapus baris kosong berturut-turut
+    cleaned = []
     prev_empty = False
     for line in text.split("\n"):
         is_empty = line.strip() == ""
         if is_empty and prev_empty:
             continue
-        cleaned_lines.append(line)
+        cleaned.append(line)
         prev_empty = is_empty
-
-    return "\n".join(cleaned_lines).strip()
+    return "\n".join(cleaned).strip()
 
 
 def verify_ascii(text: str, label: str = "text") -> bool:
-    """Return True jika 100% ASCII. Print warning jika ada yang lolos."""
+    """Return True jika 100% ASCII."""
     bad = [(i, ch) for i, ch in enumerate(text) if ord(ch) > 126]
     if bad:
         print(f"      ⚠️  NON-ASCII in {label}:")
@@ -139,6 +134,38 @@ def verify_ascii(text: str, label: str = "text") -> bool:
             print(f"         pos={pos} char={repr(ch)} ord={ord(ch)}")
         return False
     return True
+
+
+# ══════════════════════════════════════════════════════
+#  SAFE JSON POST — FIX UTAMA
+# ══════════════════════════════════════════════════════
+def safe_post_json(url: str, headers: dict, payload: dict, timeout: int = 60):
+    """
+    POST JSON dengan encoding 100% terkontrol.
+    FIX: manual serialize → bytes, JANGAN pakai requests json= parameter.
+    """
+    # Step 1: Serialize JSON sebagai string ASCII
+    json_str = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+    # Step 2: Verifikasi tidak ada non-ASCII
+    if not verify_ascii(json_str, "JSON body"):
+        print(f"      🔴 JSON masih ada non-ASCII! Force clean...")
+        json_str = force_ascii(json_str)
+        # Re-parse dan re-serialize untuk validasi
+        payload = json.loads(json_str)
+        json_str = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+    # Step 3: Encode ke bytes UTF-8
+    body_bytes = json_str.encode("utf-8")
+
+    # Step 4: Debug — print info body
+    print(f"      🔍 Body: {len(body_bytes)} bytes, preview: {json_str[:120]}...")
+
+    # Step 5: Kirim dengan data= (bytes), BUKAN json= (dict)
+    h = dict(headers)
+    h["Content-Type"] = "application/json"
+
+    return requests.post(url, data=body_bytes, headers=h, timeout=timeout)
 
 
 # ══════════════════════════════════════════════════════
@@ -150,8 +177,7 @@ LYRIC_SYSTEM = (
     "CRITICAL: Use ONLY these characters:\n"
     "  a-z A-Z 0-9 ! ? . , : ; ' \" ( ) - / \\n space\n"
     "NO arrows, emoji, symbols, accented letters, or unicode.\n"
-    "NO curly quotes, em dashes, ellipsis, bullets.\n"
-    "Write lyrics only, no explanation or commentary."
+    "Write lyrics only, no explanation."
 )
 
 
@@ -172,32 +198,35 @@ def _lyrics_prompt(title: str, music_prompt: str) -> str:
 # ══════════════════════════════════════════════════════
 #  LYRIC GENERATOR — GEMINI
 # ══════════════════════════════════════════════════════
-def generate_lyrics_gemini(title: str, music_prompt: str) -> str:
-    client = genai.Client(api_key=GEMINI_KEY)
-    models = ["gemini-2.0-flash-lite", "gemini-2.0-flash"]
-    for model_name in models:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=_lyrics_prompt(title, music_prompt),
-            )
-            lyrics = response.text.strip()
-            if lyrics:
-                print(f"      ✅ Gemini OK ({model_name})")
-                return lyrics
-        except Exception as e:
-            err = str(e)
-            if "limit: 0" in err or "429" in err or "RESOURCE_EXHAUSTED" in err:
-                print(f"      ⚠️  Gemini quota/rate limit, skip")
-                break
-            print(f"      ⚠️  [{model_name}] error: {e}")
+def generate_lyrics_gemini(title: str, music_prompt: str):
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        models = ["gemini-2.0-flash-lite", "gemini-2.0-flash"]
+        for model_name in models:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=_lyrics_prompt(title, music_prompt),
+                )
+                lyrics = response.text.strip()
+                if lyrics:
+                    print(f"      ✅ Gemini OK ({model_name})")
+                    return lyrics
+            except Exception as e:
+                err = str(e)
+                if "limit: 0" in err or "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    print(f"      ⚠️  Gemini quota/rate limit, skip")
+                    return None
+                print(f"      ⚠️  [{model_name}] error: {e}")
+    except Exception as e:
+        print(f"      ⚠️  Gemini init error: {e}")
     return None
 
 
 # ══════════════════════════════════════════════════════
 #  LYRIC GENERATOR — OPENROUTER
 # ══════════════════════════════════════════════════════
-def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
+def generate_lyrics_openrouter(title: str, music_prompt: str):
     free_models = [
         "meta-llama/llama-3.3-70b-instruct:free",
         "mistralai/mistral-small-3.1-24b-instruct:free",
@@ -237,7 +266,6 @@ def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
             resp.raise_for_status()
             data = resp.json()
             if "choices" not in data or not data["choices"]:
-                print(f"      ⚠️  [{model}] no choices, skip")
                 continue
             lyrics = data["choices"][0]["message"]["content"].strip()
             if lyrics:
@@ -246,39 +274,32 @@ def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
         except Exception as e:
             print(f"      ⚠️  [{model}] gagal: {e}")
             time.sleep(2)
-            continue
     return None
 
 
 # ══════════════════════════════════════════════════════
-#  GENERATE LYRICS — SIMPLIFIED FALLBACK
+#  GENERATE LYRICS — FALLBACK
 # ══════════════════════════════════════════════════════
 def generate_lyrics(title: str, music_prompt: str):
-    """
-    Return (lyrics, use_custom).
-    lyrics = None → Suno auto-generate lirik.
-    """
+    """Return (lyrics, use_custom). lyrics=None → Suno auto."""
     raw = None
 
-    # ── Coba Gemini ──
     if GEMINI_KEY:
         print("      📝 Generating lyrics (Gemini)...")
         raw = generate_lyrics_gemini(title, music_prompt)
         if raw:
             raw = force_ascii(raw)
-            if not verify_ascii(raw, "Gemini output"):
-                raw = None  # Ada yang lolos, buang
+            if not verify_ascii(raw, "Gemini lyrics"):
+                raw = None
 
-    # ── Coba OpenRouter ──
     if raw is None and OPENROUTER_KEY:
         print("      📝 Fallback to OpenRouter...")
         raw = generate_lyrics_openrouter(title, music_prompt)
         if raw:
             raw = force_ascii(raw)
-            if not verify_ascii(raw, "OpenRouter output"):
-                raw = None  # Ada yang lolos, buang
+            if not verify_ascii(raw, "OpenRouter lyrics"):
+                raw = None
 
-    # ── Semua gagal → Suno auto ──
     if raw is None:
         print("      🎵 Semua AI gagal → Suno auto-generate lirik")
         return None, False
@@ -292,27 +313,20 @@ def generate_lyrics(title: str, music_prompt: str):
 def suno_headers(token: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
+        "Accept": "application/json",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36"
         ),
-        "Accept": "application/json",
     }
 
 
 def suno_generate(token, title, lyrics, style_tags, use_custom):
+    title_safe  = force_ascii(title)
+    style_safe  = force_ascii(style_tags)
+
     if use_custom and lyrics:
-        # ══ TRIPLE SANITIZE ══
         lyrics_safe = force_ascii(lyrics)
-        title_safe  = force_ascii(title)
-        style_safe  = force_ascii(style_tags)
-
-        # Final verification
-        verify_ascii(lyrics_safe, "FINAL lyrics")
-        verify_ascii(title_safe, "FINAL title")
-        verify_ascii(style_safe, "FINAL style")
-
         payload = {
             "mv": "chirp-v3-5",
             "prompt": lyrics_safe,
@@ -324,8 +338,6 @@ def suno_generate(token, title, lyrics, style_tags, use_custom):
         }
         print(f"      🎼 Mode: Custom lyrics")
     else:
-        title_safe = force_ascii(title)
-        style_safe = force_ascii(style_tags)
         payload = {
             "mv": "chirp-v3-5",
             "prompt": f"{title_safe}. {style_safe}",
@@ -337,12 +349,8 @@ def suno_generate(token, title, lyrics, style_tags, use_custom):
         }
         print(f"      🎼 Mode: Suno auto-lyrics")
 
-    resp = requests.post(
-        SUNO_GENERATE,
-        headers=suno_headers(token),
-        json=payload,
-        timeout=60,
-    )
+    # ══ FIX UTAMA: pakai safe_post_json, BUKAN requests.post(json=) ══
+    resp = safe_post_json(SUNO_GENERATE, suno_headers(token), payload)
 
     if resp.status_code == 401:
         raise Exception("Token expired/invalid. Refresh token.")
@@ -486,7 +494,7 @@ def process_batch(batch, music_prompt, style_tags, token, account_idx):
 # ══════════════════════════════════════════════════════
 def main():
     print("\n" + "═"*55)
-    print("  🎵  SUNO AUTO GENERATOR v10")
+    print("  🎵  SUNO AUTO GENERATOR v11")
     print("═"*55)
 
     if not SUNO_TOKENS:
@@ -495,6 +503,14 @@ def main():
     config       = load_config()
     music_prompt = config["music_prompt"]
     style_tags   = config["style_tags"]
+
+    # ══ FIX: sanitize config values di awal ══
+    music_prompt = force_ascii(music_prompt)
+    style_tags   = force_ascii(style_tags)
+    print(f"  DEBUG: music_prompt = {music_prompt[:80]}...")
+    print(f"  DEBUG: style_tags   = {style_tags[:80]}...")
+    verify_ascii(music_prompt, "config music_prompt")
+    verify_ascii(style_tags, "config style_tags")
 
     all_titles     = load_titles()
     done_set       = load_done()
