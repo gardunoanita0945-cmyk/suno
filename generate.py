@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════╗
-║         SUNO AUTO GENERATOR — Full Script v6         ║
-║  Lyric fallback: Gemini → OpenRouter → Suno Auto     ║
-║  Input  : titles.txt + config.json                   ║
-║  Output : output_audio/ (MP3 + TXT lyrics)           ║
-║  Track  : done.txt                                   ║
+║         SUNO AUTO GENERATOR — Full Script v7         ║
+║  Lyric : Gemini → OpenRouter → Suno Auto             ║
+║  Fix   : latin-1 encode, gemini quota skip           ║
+║  Input : titles.txt + config.json                    ║
+║  Track : done.txt                                    ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -83,8 +83,22 @@ def safe_filename(title: str) -> str:
         title = title.replace(c, "")
     return title.replace(" ", "_")
 
+def clean_lyrics(text: str) -> str:
+    """Bersihkan karakter non-ASCII agar tidak error latin-1 saat kirim ke Suno."""
+    replacements = {
+        "\u2190": "<-",  "\u2192": "->",  "\u2194": "<->",
+        "\u2019": "'",   "\u2018": "'",   "\u201c": '"',
+        "\u201d": '"',   "\u2026": "...", "\u2014": "--",
+        "\u2013": "-",   "\u2022": "-",   "\u00e9": "e",
+        "\u00e0": "a",   "\u00e8": "e",   "\u00f1": "n",
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    # Buang semua karakter yang masih non-ASCII
+    return text.encode("ascii", errors="ignore").decode("ascii").strip()
+
 # ══════════════════════════════════════════════════════
-#  LYRIC PROMPT TEMPLATE
+#  LYRIC PROMPT
 # ══════════════════════════════════════════════════════
 def _lyrics_prompt(title: str, music_prompt: str) -> str:
     return (
@@ -98,6 +112,7 @@ def _lyrics_prompt(title: str, music_prompt: str) -> str:
         f"[Outro]\n(outro lyrics)\n\n"
         f"Rules:\n"
         f"- Maximum 300 words\n"
+        f"- Use ONLY basic ASCII characters, no special symbols\n"
         f"- Write lyrics ONLY, no explanation\n"
         f"- Write in English\n"
         f"- Make it emotional and meaningful\n"
@@ -105,17 +120,13 @@ def _lyrics_prompt(title: str, music_prompt: str) -> str:
 
 # ══════════════════════════════════════════════════════
 #  LYRIC GENERATOR — GEMINI
-#  Hanya gemini-2.0-flash-lite (murah quota, stabil 2026)
 # ══════════════════════════════════════════════════════
 def generate_lyrics_gemini(title: str, music_prompt: str) -> str:
     client = genai.Client(api_key=GEMINI_KEY)
-    models = [
-        "gemini-2.0-flash-lite",
-        "gemini-2.0-flash",
-    ]
+    models = ["gemini-2.0-flash-lite", "gemini-2.0-flash"]
     last_error = None
     for model_name in models:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = client.models.generate_content(
                     model=model_name,
@@ -128,9 +139,13 @@ def generate_lyrics_gemini(title: str, music_prompt: str) -> str:
             except Exception as e:
                 last_error = e
                 err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    wait = 20 * (attempt + 1)
-                    print(f"      ⏳ Rate limit [{model_name}] tunggu {wait}s (attempt {attempt+1}/3)...")
+                # Quota habis total (limit: 0) → skip langsung, tidak perlu retry
+                if "limit: 0" in err_str:
+                    print(f"      ⚠️  Gemini quota habis hari ini, skip ke OpenRouter")
+                    raise Exception(f"Gemini quota habis: {e}")
+                elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait = 15 * (attempt + 1)
+                    print(f"      ⏳ Rate limit [{model_name}] tunggu {wait}s (attempt {attempt+1}/2)...")
                     time.sleep(wait)
                 else:
                     print(f"      ⚠️  [{model_name}] error: {e}")
@@ -138,16 +153,13 @@ def generate_lyrics_gemini(title: str, music_prompt: str) -> str:
     raise Exception(f"Gemini gagal: {last_error}")
 
 # ══════════════════════════════════════════════════════
-#  LYRIC GENERATOR — OPENROUTER (model aktif 2026)
+#  LYRIC GENERATOR — OPENROUTER
 # ══════════════════════════════════════════════════════
 def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
-    # Model gratis aktif per Maret 2026
     free_models = [
         "meta-llama/llama-3.3-70b-instruct:free",
         "mistralai/mistral-small-3.1-24b-instruct:free",
         "google/gemma-3-27b-it:free",
-        "google/gemma-3-12b-it:free",
-        "nvidia/nemotron-nano-9b-v2:free",
         "qwen/qwen3-4b:free",
         "openrouter/auto",
     ]
@@ -167,7 +179,8 @@ def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
                         "role": "system",
                         "content": (
                             "You are a professional song lyric writer. "
-                            "Write lyrics in English only. "
+                            "Write lyrics in English only using basic ASCII characters. "
+                            "Do NOT use special symbols, arrows, or unicode characters. "
                             "Do not add any explanation, only write the lyrics."
                         ),
                     },
@@ -186,11 +199,15 @@ def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
                 timeout=60,
             )
             if resp.status_code == 429:
-                print(f"      ⏳ OpenRouter [{model}] rate limit, tunggu 30s...")
-                time.sleep(30)
+                print(f"      ⏳ OpenRouter [{model}] rate limit, tunggu 20s...")
+                time.sleep(20)
                 continue
             resp.raise_for_status()
-            lyrics = resp.json()["choices"][0]["message"]["content"].strip()
+            data = resp.json()
+            if "choices" not in data or not data["choices"]:
+                print(f"      ⚠️  [{model}] no choices in response")
+                continue
+            lyrics = data["choices"][0]["message"]["content"].strip()
             if lyrics:
                 print(f"      ✅ OpenRouter OK ({model})")
                 return lyrics
@@ -205,11 +222,7 @@ def generate_lyrics_openrouter(title: str, music_prompt: str) -> str:
 #  LYRIC GENERATOR — AUTO FALLBACK CHAIN
 # ══════════════════════════════════════════════════════
 def generate_lyrics(title: str, music_prompt: str):
-    """
-    Return (lyrics, use_custom):
-    - lyrics = string lirik / None jika pakai Suno auto
-    - use_custom = True jika punya lirik, False jika Suno generate sendiri
-    """
+    """Return (lyrics, use_custom). lyrics=None → pakai Suno auto."""
     if GEMINI_KEY:
         try:
             print("      📝 Generating lyrics (Gemini)...")
@@ -224,8 +237,7 @@ def generate_lyrics(title: str, music_prompt: str):
         except Exception as e:
             print(f"      ⚠️  OpenRouter gagal → {e}")
 
-    # FALLBACK TERAKHIR: Biarkan Suno generate lirik sendiri
-    print("      🎵 Fallback: Suno akan auto-generate lirik sendiri")
+    print("      🎵 Fallback: Suno auto-generate lirik sendiri")
     return None, False
 
 # ══════════════════════════════════════════════════════
@@ -241,7 +253,6 @@ def suno_headers(token: str) -> dict:
 
 def suno_generate(token: str, title: str, lyrics, style_tags: str, use_custom: bool) -> list:
     if use_custom and lyrics:
-        # Mode custom: pakai lirik dari AI
         payload = {
             "mv": "chirp-v3-5",
             "prompt": lyrics,
@@ -253,7 +264,6 @@ def suno_generate(token: str, title: str, lyrics, style_tags: str, use_custom: b
         }
         print(f"      🎼 Mode: Custom lyrics")
     else:
-        # Mode auto: Suno generate lirik sendiri dari deskripsi judul
         payload = {
             "mv": "chirp-v3-5",
             "prompt": f"{title}. {style_tags}",
@@ -284,22 +294,23 @@ def suno_generate(token: str, title: str, lyrics, style_tags: str, use_custom: b
 
 def suno_poll(token: str, clip_ids: list) -> list:
     ids_str = ",".join(clip_ids)
-    print(f"      ⏳ Polling audio (max {POLL_MAX_RETRY * POLL_INTERVAL // 60} menit)...")
+    max_menit = POLL_MAX_RETRY * POLL_INTERVAL // 60
+    print(f"      ⏳ Polling audio (max {max_menit} menit)...")
     for attempt in range(POLL_MAX_RETRY):
         try:
             resp = requests.get(
                 f"{SUNO_FEED}?ids={ids_str}",
-                headers=suno_headers(token),
+                headers=suno_headers(""),
                 timeout=30,
             )
             if resp.status_code != 200:
-                print(f"      ⚠️  Poll error {resp.status_code}, retry...")
+                print(f"      ⚠️  Poll {resp.status_code}, retry...")
                 time.sleep(POLL_INTERVAL)
                 continue
 
             clips    = resp.json()
             statuses = [c.get("status", "") for c in clips]
-            print(f"      📊 [{attempt+1}/{POLL_MAX_RETRY}] Status: {statuses}")
+            print(f"      📊 [{attempt+1}/{POLL_MAX_RETRY}] {statuses}")
 
             if all(s == "complete" for s in statuses):
                 print("      ✅ Audio selesai!")
@@ -313,7 +324,7 @@ def suno_poll(token: str, clip_ids: list) -> list:
             print(f"      ⚠️  Poll exception: {e}")
 
         time.sleep(POLL_INTERVAL)
-    raise Exception(f"Polling timeout setelah {POLL_MAX_RETRY * POLL_INTERVAL // 60} menit")
+    raise Exception(f"Polling timeout setelah {max_menit} menit")
 
 def suno_download(clips: list, title: str) -> list:
     saved = []
@@ -349,22 +360,25 @@ def process_batch(batch, music_prompt, style_tags, token, account_idx) -> list:
     for song_idx, title in enumerate(batch, 1):
         print(f"\n    [{song_idx}/{len(batch)}] 🎵 {title}")
         try:
-            # Step 1 — Generate lirik (dengan fallback ke Suno auto)
+            # Step 1 — Generate lirik
             lyrics, use_custom = generate_lyrics(title, music_prompt)
 
-            # Simpan lirik TXT jika ada
+            # Bersihkan karakter non-ASCII sebelum kirim ke Suno
+            if lyrics:
+                lyrics = clean_lyrics(lyrics)
+
+            # Simpan lirik TXT
             if lyrics:
                 lyric_path = os.path.join(OUTPUT_DIR, f"{safe_filename(title)}_lyrics.txt")
                 with open(lyric_path, "w", encoding="utf-8") as lf:
                     lf.write(f"Title  : {title}\n")
                     lf.write(f"Prompt : {music_prompt}\n")
                     lf.write(f"Style  : {style_tags}\n")
-                    lf.write(f"Source : {'Gemini/OpenRouter' if use_custom else 'Suno Auto'}\n")
                     lf.write("─" * 40 + "\n\n")
                     lf.write(lyrics)
                 print(f"      📄 Lyrics saved: {lyric_path}")
             else:
-                print(f"      📄 Lirik akan di-generate otomatis oleh Suno")
+                print(f"      📄 Suno akan auto-generate lirik")
 
             # Step 2 — Generate & download audio
             generate_audio(token, title, lyrics, style_tags, use_custom)
@@ -388,7 +402,7 @@ def process_batch(batch, music_prompt, style_tags, token, account_idx) -> list:
 # ══════════════════════════════════════════════════════
 def main():
     print("\n" + "═" * 55)
-    print("  🎵  SUNO AUTO GENERATOR v6")
+    print("  🎵  SUNO AUTO GENERATOR v7")
     print("═" * 55)
 
     if not SUNO_TOKENS:
@@ -409,8 +423,8 @@ def main():
     print(f"  Total titles   : {len(all_titles)}")
     print(f"  Already done   : {len(done_set)}")
     print(f"  Will process   : {len(to_process)}")
-    print(f"\n  LLM Gemini     : {'✅ ready' if GEMINI_KEY else '⚠️  tidak ada key'}")
-    print(f"  LLM OpenRouter : {'✅ ready' if OPENROUTER_KEY else '⚠️  tidak ada key'}")
+    print(f"\n  LLM Gemini     : {'✅ ready' if GEMINI_KEY else '⚠️  skip'}")
+    print(f"  LLM OpenRouter : {'✅ ready' if OPENROUTER_KEY else '⚠️  skip'}")
     print(f"  Lyric fallback : ✅ Suno auto-generate")
 
     if not to_process:
